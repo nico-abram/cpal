@@ -149,83 +149,92 @@ impl EventLoop {
     }
 
     #[inline]
-    fn run<F>(&self, callback: F) -> !
+    fn run<F>(&self,callback: F) -> !
         where F: FnMut(StreamId, StreamDataResult),
+    {
+        let callback: Box<dyn FnMut(StreamId, StreamDataResult)> = Box::new(callback);
+        // I am not actually confident that this is sound. However, as far as 
+        // I know it is the only thing we can do with the current API
+        // (Where F: 'static is not a bound we're enforcing)
+        let callback: Box<dyn FnMut(StreamId, StreamDataResult) + 'static> = unsafe { std::mem::transmute(callback) };
+        self.safe_run(callback)
+    }
+
+    #[inline]
+    fn safe_run(&self, mut callback: Box<dyn FnMut(StreamId, StreamDataResult) + 'static>) -> !
     {
         // The `run` function uses `set_timeout` to invoke a Rust callback repeatidely. The job
         // of this callback is to fill the content of the audio buffers.
 
-        // The first argument of the callback function (a `void*`) is a casted pointer to `self`
-        // and to the `callback` parameter that was passed to `run`.
-
-        fn callback_fn<F>(user_data_ptr: *mut c_void)
-            where F: FnMut(StreamId, StreamDataResult)
+        fn callback_fn(event_loop: &'static EventLoop, mut callback: Box<dyn FnMut(StreamId, StreamDataResult) + 'static>)
         {
-            unsafe {
-                let user_data_ptr2 = user_data_ptr as *mut (&EventLoop, F);
-                let user_data = &mut *user_data_ptr2;
-                let user_cb = &mut user_data.1;
+            let streams = event_loop.streams.lock().unwrap().clone();
+            for (stream_id, stream) in streams.iter().enumerate() {
+                let stream = match stream.as_ref() {
+                    Some(v) => v,
+                    None => continue,
+                };
 
-                let streams = user_data.0.streams.lock().unwrap().clone();
-                for (stream_id, stream) in streams.iter().enumerate() {
-                    let stream = match stream.as_ref() {
-                        Some(v) => v,
-                        None => continue,
-                    };
+                let mut temporary_buffer = vec![0.0; 44100 * 2 / 3];
 
-                    let mut temporary_buffer = vec![0.0; 44100 * 2 / 3];
-
-                    {
-                        let buffer = UnknownTypeOutputBuffer::F32(::OutputBuffer { buffer: &mut temporary_buffer });
-                        let data = StreamData::Output { buffer: buffer };
-                        user_cb(StreamId(stream_id), Ok(data));
-                        // TODO: directly use a TypedArray<f32> once this is supported by stdweb
-                    }
-
-                    let typed_array = {
-                        let f32_slice = temporary_buffer.as_slice();
-                        let u8_slice: &[u8] = from_raw_parts(
-                            f32_slice.as_ptr() as *const _,
-                            f32_slice.len() * mem::size_of::<f32>(),
-                        );
-                        let typed_array: TypedArray<u8> = u8_slice.into();
-                        typed_array
-                    };
-
-                    let num_channels = 2u32; // TODO: correct value
-                    debug_assert_eq!(temporary_buffer.len() % num_channels as usize, 0);
-
-                    js!(
-                        var src_buffer = new Float32Array(@{typed_array}.buffer);
-                        var context = @{stream};
-                        var buf_len = @{temporary_buffer.len() as u32};
-                        var num_channels = @{num_channels};
-
-                        var buffer = context.createBuffer(num_channels, buf_len / num_channels, 44100);
-                        for (var channel = 0; channel < num_channels; ++channel) {
-                            var buffer_content = buffer.getChannelData(channel);
-                            for (var i = 0; i < buf_len / num_channels; ++i) {
-                                buffer_content[i] = src_buffer[i * num_channels + channel];
-                            }
-                        }
-
-                        var node = context.createBufferSource();
-                        node.buffer = buffer;
-                        node.connect(context.destination);
-                        node.start();
-                    );
+                {
+                    let buffer = UnknownTypeOutputBuffer::F32(::OutputBuffer { buffer: &mut temporary_buffer });
+                    let data = StreamData::Output { buffer: buffer };
+                    callback(StreamId(stream_id), Ok(data));
+                    // TODO: directly use a TypedArray<f32> once this is supported by stdweb
                 }
 
-                set_timeout(|| callback_fn::<F>(user_data_ptr), 330);
+                let typed_array = {
+                    let f32_slice = temporary_buffer.as_slice();
+                    // This should be sound since alignment(u8) <= aligment(f32),
+                    // We're doing the length math correctly, and
+                    // we're using the raw_parts API
+                    let u8_slice: &[u8] = unsafe { from_raw_parts(
+                        f32_slice.as_ptr() as *const _,
+                        f32_slice.len() * mem::size_of::<f32>(),
+                    ) };
+                    let typed_array: TypedArray<u8> = u8_slice.into();
+                    typed_array
+                };
+
+                let num_channels = 2u32; // TODO: correct value
+                debug_assert_eq!(temporary_buffer.len() % num_channels as usize, 0);
+
+                js!(
+                    var src_buffer = new Float32Array(@{typed_array}.buffer);
+                    var context = @{stream};
+                    var buf_len = @{temporary_buffer.len() as u32};
+                    var num_channels = @{num_channels};
+
+                    var buffer = context.createBuffer(num_channels, buf_len / num_channels, 44100);
+                    for (var channel = 0; channel < num_channels; ++channel) {
+                        var buffer_content = buffer.getChannelData(channel);
+                        for (var i = 0; i < buf_len / num_channels; ++i) {
+                            buffer_content[i] = src_buffer[i * num_channels + channel];
+                        }
+                    }
+
+                    var node = context.createBufferSource();
+                    node.buffer = buffer;
+                    node.connect(context.destination);
+                    node.start();
+                );
             }
+
+            set_timeout(move || callback_fn(event_loop, callback), 330);
         }
 
-        let mut user_data = (self, callback);
-        let user_data_ptr = &mut user_data as *mut (_, _);
-
-        set_timeout(|| callback_fn::<F>(user_data_ptr as *mut _), 10);
+        // Extending self here to be static *should* be fine, I think
+        // Since we're throwing right after. I am not entirely sure
+        fn extend<T:?Sized>(x:&T) -> &'static T { unsafe { std::mem::transmute(x) } }
+        let ext_self = extend(self);
+        set_timeout(move || callback_fn(ext_self, callback), 10);
 
         stdweb::event_loop();
+        js! {
+            throw "";
+        }
+        unreachable!()
     }
 
     #[inline]
@@ -284,7 +293,7 @@ pub struct StreamId(usize);
 
 // Detects whether the `AudioContext` global variable is available.
 fn is_webaudio_available() -> bool {
-    stdweb::initialize();
+   stdweb::initialize();
 
     js!(if (!AudioContext) {
             return false;

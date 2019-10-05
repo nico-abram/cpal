@@ -511,7 +511,7 @@ mod platform_impl {
     }
 }
 
-#[cfg(target_os = "emscripten")]
+#[cfg(any(target_os = "emscripten", all(target_arch="wasm32", target_os = "unknown", feature = "wasm-unknown-web")))]
 mod platform_impl {
     pub use crate::host::emscripten::{
         Device as EmscriptenDevice,
@@ -569,8 +569,7 @@ mod platform_impl {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "freebsd", target_os = "macos",
-              target_os = "ios", target_os = "emscripten")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "freebsd", target_os = "macos", target_os = "ios", target_os = "emscripten", all(target_arch="wasm32", target_os = "unknown", feature = "wasm-unknown-web"))))]
 mod platform_impl {
     pub use crate::host::null::{
         Device as NullDevice,
